@@ -23,7 +23,7 @@ jobs:
 
     - name: Build EXE
       run: |
-        pyinstaller --onefile --noconsole --add-data "templates;templates" --name "XOSSMonitor" app.py
+        pyinstaller --onefile --noconsole --add-data "templates;templates" --name "XOSSMonitor" flask_app.py
 
     - name: Upload artifact
       uses: actions/upload-artifact@v4
