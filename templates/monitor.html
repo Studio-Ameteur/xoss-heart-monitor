@@ -1,0 +1,367 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="UTF-8">
+<title>Монитор пульса</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  html, body {
+    width: 100%; height: 100%;
+    background: #000;
+    font-family: 'Courier New', monospace;
+    overflow: hidden;
+  }
+  .header {
+    background: #0a0a0a;
+    border-bottom: 1px solid #1a1a1a;
+    padding: 5px 12px;
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    font-family: Tahoma, Arial, sans-serif;
+    font-size: 11px;
+    height: 28px;
+  }
+  .header-title { color: #00cc00; font-weight: bold; letter-spacing: 2px; }
+  .header-time { color: #006600; font-size: 11px; }
+  .header-status { font-size: 11px; color: #006600; }
+  .header-status.ok { color: #00cc00; }
+  .header-status.warn { color: #cc8800; }
+
+  .grid {
+    display: grid;
+    padding: 6px;
+    gap: 6px;
+    height: calc(100vh - 28px);
+  }
+  .grid.n1  { grid-template-columns: 1fr; }
+  .grid.n2  { grid-template-columns: 1fr; grid-template-rows: 1fr 1fr; }
+  .grid.n3  { grid-template-columns: 1fr; grid-template-rows: 1fr 1fr 1fr; }
+  .grid.n4  { grid-template-columns: 1fr 1fr; grid-template-rows: 1fr 1fr; }
+  .grid.n5, .grid.n6 { grid-template-columns: 1fr 1fr; grid-template-rows: 1fr 1fr 1fr; }
+  .grid.n7, .grid.n8 { grid-template-columns: 1fr 1fr; grid-template-rows: 1fr 1fr 1fr 1fr; }
+  .grid.n9, .grid.n10 { grid-template-columns: 1fr 1fr; grid-template-rows: 1fr 1fr 1fr 1fr 1fr; }
+
+  .card {
+    background: #000;
+    border: 1px solid #003300;
+    border-radius: 4px;
+    display: flex;
+    flex-direction: row;
+    align-items: stretch;
+    overflow: hidden;
+    position: relative;
+  }
+  .card.connected { border-color: #006600; }
+
+  .card-info {
+    width: 90px;
+    min-width: 90px;
+    background: #050505;
+    border-right: 1px solid #003300;
+    display: flex;
+    flex-direction: column;
+    justify-content: center;
+    padding: 8px 6px;
+  }
+  .card.connected .card-info { border-right-color: #006600; }
+  .card-name {
+    font-family: Tahoma, Arial, sans-serif;
+    font-size: 10px;
+    color: #006600;
+    text-transform: uppercase;
+    letter-spacing: 1px;
+    margin-bottom: 4px;
+  }
+  .card.connected .card-name { color: #00aa00; }
+  .hr-big {
+    font-size: 36px;
+    font-weight: bold;
+    color: #003300;
+    line-height: 1;
+    font-variant-numeric: tabular-nums;
+  }
+  .card.connected .hr-big { color: #00ff00; }
+  .hr-unit {
+    font-family: Tahoma, Arial, sans-serif;
+    font-size: 9px;
+    color: #004400;
+    margin-top: 2px;
+  }
+  .card.connected .hr-unit { color: #006600; }
+  .card-status {
+    font-family: Tahoma, Arial, sans-serif;
+    font-size: 9px;
+    color: #003300;
+    margin-top: 6px;
+  }
+  .card.connected .card-status { color: #005500; }
+
+  .canvas-wrap {
+    flex: 1;
+    position: relative;
+    overflow: hidden;
+  }
+  canvas {
+    position: absolute;
+    top: 0; left: 0;
+    width: 100%;
+    height: 100%;
+  }
+
+  .empty-msg {
+    grid-column: 1 / -1;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    color: #003300;
+    font-family: Tahoma, Arial, sans-serif;
+    font-size: 13px;
+  }
+</style>
+</head>
+<body>
+
+<div class="header">
+  <div class="header-title">XOSS HEART MONITOR</div>
+  <div class="header-status warn" id="headerStatus">Нет датчиков</div>
+  <div class="header-time" id="headerTime"></div>
+</div>
+
+<div class="grid" id="grid"></div>
+
+<script>
+const HISTORY = 200;
+const sensors_history = {};
+const canvases = {};
+const contexts = {};
+let prevCount = -1;
+let animFrame = null;
+
+function getGridClass(n) {
+  if (n <= 0) return "n1";
+  if (n <= 10) return `n${n}`;
+  return "n10";
+}
+
+function initHistory(id) {
+  sensors_history[id] = new Array(HISTORY).fill(0);
+}
+
+function pushHr(id, hr) {
+  if (!sensors_history[id]) initHistory(id);
+  sensors_history[id].push(hr);
+  if (sensors_history[id].length > HISTORY) {
+    sensors_history[id].shift();
+  }
+}
+
+function drawEcg(id, connected) {
+  const canvas = canvases[id];
+  const ctx = contexts[id];
+  if (!canvas || !ctx) return;
+
+  const W = canvas.width;
+  const H = canvas.height;
+
+  ctx.fillStyle = "#000";
+  ctx.fillRect(0, 0, W, H);
+
+  // grid lines
+  ctx.strokeStyle = "#001a00";
+  ctx.lineWidth = 0.5;
+  const cols = 10;
+  const rows = 5;
+  for (let i = 0; i <= cols; i++) {
+    ctx.beginPath();
+    ctx.moveTo((i / cols) * W, 0);
+    ctx.lineTo((i / cols) * W, H);
+    ctx.stroke();
+  }
+  for (let i = 0; i <= rows; i++) {
+    ctx.beginPath();
+    ctx.moveTo(0, (i / rows) * H);
+    ctx.lineTo(W, (i / rows) * H);
+    ctx.stroke();
+  }
+
+  if (!connected) {
+    ctx.strokeStyle = "#003300";
+    ctx.lineWidth = 1;
+    ctx.beginPath();
+    ctx.moveTo(0, H / 2);
+    ctx.lineTo(W, H / 2);
+    ctx.stroke();
+    return;
+  }
+
+  const hist = sensors_history[id] || [];
+  if (hist.length < 2) return;
+
+  const vals = hist.filter(v => v > 0);
+  const minV = vals.length ? Math.min(...vals) - 10 : 40;
+  const maxV = vals.length ? Math.max(...vals) + 10 : 120;
+  const range = Math.max(maxV - minV, 20);
+
+  // ECG glow effect - draw 3 times with decreasing opacity for glow
+  const glowLayers = [
+    { color: "rgba(0,255,0,0.08)", width: 6 },
+    { color: "rgba(0,255,0,0.2)",  width: 3 },
+    { color: "rgba(0,255,0,1)",    width: 1.5 },
+  ];
+
+  glowLayers.forEach(layer => {
+    ctx.strokeStyle = layer.color;
+    ctx.lineWidth = layer.width;
+    ctx.lineJoin = "round";
+    ctx.lineCap = "round";
+    ctx.beginPath();
+
+    const step = W / (HISTORY - 1);
+    hist.forEach((v, i) => {
+      const hr = v > 0 ? v : (minV + range / 2);
+      const x = i * step;
+      const y = H - ((hr - minV) / range) * H * 0.8 - H * 0.1;
+
+      // simulate ECG spike when value changes significantly
+      if (i === 0) ctx.moveTo(x, y);
+      else ctx.lineTo(x, y);
+    });
+    ctx.stroke();
+  });
+
+  // moving cursor line
+  const cursorX = (hist.length - 1) * (W / (HISTORY - 1));
+  ctx.strokeStyle = "rgba(0,255,0,0.4)";
+  ctx.lineWidth = 1;
+  ctx.setLineDash([3, 3]);
+  ctx.beginPath();
+  ctx.moveTo(cursorX, 0);
+  ctx.lineTo(cursorX, H);
+  ctx.stroke();
+  ctx.setLineDash([]);
+}
+
+function resizeCanvases() {
+  Object.keys(canvases).forEach(id => {
+    const canvas = canvases[id];
+    if (canvas) {
+      canvas.width = canvas.offsetWidth;
+      canvas.height = canvas.offsetHeight;
+    }
+  });
+}
+
+function renderLoop() {
+  Object.keys(canvases).forEach(id => {
+    const card = document.getElementById(`mcard_${id}`);
+    const connected = card && card.classList.contains("connected");
+    drawEcg(id, connected);
+  });
+  animFrame = requestAnimationFrame(renderLoop);
+}
+
+function buildGrid(data) {
+  const grid = document.getElementById("grid");
+  const n = data.length;
+  grid.className = "grid " + getGridClass(n);
+
+  if (n === 0) {
+    if (animFrame) cancelAnimationFrame(animFrame);
+    grid.innerHTML = '<div class="empty-msg">Нет датчиков. Добавьте датчики в основном окне.</div>';
+    prevCount = 0;
+    return;
+  }
+
+  if (n !== prevCount) {
+    if (animFrame) cancelAnimationFrame(animFrame);
+    grid.innerHTML = "";
+    Object.keys(canvases).forEach(k => { delete canvases[k]; delete contexts[k]; });
+
+    data.forEach(s => {
+      if (!sensors_history[s.id]) initHistory(s.id);
+      const card = document.createElement("div");
+      card.id = `mcard_${s.id}`;
+      card.className = "card";
+      card.innerHTML = `
+        <div class="card-info">
+          <div class="card-name">${s.name}</div>
+          <div class="hr-big" id="mhr_${s.id}">---</div>
+          <div class="hr-unit" id="munit_${s.id}"></div>
+          <div class="card-status" id="mstatus_${s.id}">Отключен</div>
+        </div>
+        <div class="canvas-wrap">
+          <canvas id="mcanvas_${s.id}"></canvas>
+        </div>`;
+      grid.appendChild(card);
+
+      const canvas = document.getElementById(`mcanvas_${s.id}`);
+      canvases[s.id] = canvas;
+      contexts[s.id] = canvas.getContext("2d");
+    });
+
+    setTimeout(() => {
+      resizeCanvases();
+      renderLoop();
+    }, 50);
+
+    prevCount = n;
+  }
+
+  let connectedCount = 0;
+  data.forEach(s => {
+    const card = document.getElementById(`mcard_${s.id}`);
+    if (!card) return;
+    const hrEl = document.getElementById(`mhr_${s.id}`);
+    const unitEl = document.getElementById(`munit_${s.id}`);
+    const statusEl = document.getElementById(`mstatus_${s.id}`);
+
+    if (s.connected) {
+      connectedCount++;
+      card.className = "card connected";
+      pushHr(s.id, s.hr);
+      hrEl.textContent = s.hr || "---";
+      unitEl.textContent = "уд/мин";
+      statusEl.textContent = "Подключен";
+    } else {
+      card.className = "card";
+      pushHr(s.id, 0);
+      hrEl.textContent = "---";
+      unitEl.textContent = "";
+      statusEl.textContent = s.status === "connecting" ? "Подключение..." : "Отключен";
+    }
+  });
+
+  const statusEl = document.getElementById("headerStatus");
+  if (connectedCount === 0) {
+    statusEl.textContent = "Нет подключений";
+    statusEl.className = "header-status warn";
+  } else {
+    statusEl.textContent = `Подключено: ${connectedCount} / ${n}`;
+    statusEl.className = connectedCount === n ? "header-status ok" : "header-status warn";
+  }
+}
+
+function updateTime() {
+  document.getElementById("headerTime").textContent = new Date().toLocaleString("ru-RU");
+}
+
+async function fetchSensors() {
+  try {
+    const r = await fetch("/api/sensors");
+    const data = await r.json();
+    buildGrid(data);
+  } catch(e) {}
+}
+
+window.addEventListener("resize", () => {
+  resizeCanvases();
+});
+
+setInterval(fetchSensors, 1000);
+setInterval(updateTime, 1000);
+fetchSensors();
+updateTime();
+</script>
+</body>
+</html>
