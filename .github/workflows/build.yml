@@ -21,9 +21,24 @@ jobs:
       run: |
         pip install flask bleak pyinstaller
 
+    - name: Create admin manifest
+      run: |
+        @"
+        <?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+        <assembly xmlns="urn:schemas-microsoft-com:asm.v1" manifestVersion="1.0">
+          <trustInfo xmlns="urn:schemas-microsoft-com:asm.v3">
+            <security>
+              <requestedPrivileges>
+                <requestedExecutionLevel level="requireAdministrator" uiAccess="false"/>
+              </requestedPrivileges>
+            </security>
+          </trustInfo>
+        </assembly>
+        "@ | Out-File -FilePath admin.manifest -Encoding UTF8
+
     - name: Build EXE
       run: |
-        pyinstaller --onefile --noconsole --add-data "templates;templates" --name "XOSSMonitor" flask_app.py
+        pyinstaller --onefile --noconsole --add-data "templates;templates" --name "XOSSMonitor" --manifest admin.manifest flask_app.py
 
     - name: Upload artifact
       uses: actions/upload-artifact@v4
