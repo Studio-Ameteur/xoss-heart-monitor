@@ -19,7 +19,7 @@ jobs:
 
     - name: Install dependencies
       run: |
-        pip install flask bleak pyinstaller
+        pip install PyQt6 bleak pyinstaller
 
     - name: Create admin manifest
       run: |
@@ -38,7 +38,7 @@ jobs:
 
     - name: Build EXE
       run: |
-        pyinstaller --onefile --noconsole --add-data "templates;templates" --name "XOSSMonitor" --manifest admin.manifest flask_app.py
+        pyinstaller --onefile --noconsole --manifest admin.manifest --hidden-import bleak --hidden-import bleak.backends.winrt --hidden-import bleak.backends.winrt.client --hidden-import bleak.backends.winrt.scanner --hidden-import PyQt6 --hidden-import PyQt6.QtWidgets --hidden-import PyQt6.QtCore --hidden-import PyQt6.QtGui --name "XOSSMonitor" main.py
 
     - name: Upload artifact
       uses: actions/upload-artifact@v4
