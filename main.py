@@ -1,5 +1,4 @@
 import sys
-import random
 import threading
 import asyncio
 import time
@@ -10,11 +9,11 @@ from datetime import datetime
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QPushButton, QLabel, QTableWidget, QTableWidgetItem, QDialog,
-    QListWidget, QListWidgetItem, QSpinBox, QSplitter, QFrame,
-    QScrollArea, QGridLayout, QMessageBox, QHeaderView
+    QListWidget, QListWidgetItem, QSpinBox, QFrame, QScrollArea,
+    QGridLayout, QHeaderView, QInputDialog, QMessageBox, QLineEdit
 )
-from PyQt6.QtCore import Qt, QTimer, pyqtSignal, QObject, QThread
-from PyQt6.QtGui import QPainter, QPen, QColor, QFont
+from PyQt6.QtCore import Qt, QTimer, pyqtSignal, QObject
+from PyQt6.QtGui import QPainter, QPen, QColor, QFont, QIcon
 
 try:
     from bleak import BleakScanner, BleakClient
@@ -23,6 +22,11 @@ except ImportError:
     BLE_AVAILABLE = False
 
 HEART_RATE_UUID = "00002a37-0000-1000-8000-00805f9b34fb"
+
+def resource_path(relative_path):
+    if hasattr(sys, '_MEIPASS'):
+        return os.path.join(sys._MEIPASS, relative_path)
+    return os.path.join(os.path.dirname(os.path.abspath(__file__)), relative_path)
 
 WIN2K = """
     QWidget {
@@ -47,16 +51,6 @@ WIN2K = """
         border-bottom: 2px solid #fff;
     }
     QPushButton:disabled { color: #808080; }
-    QGroupBox {
-        border-top: 2px solid #fff;
-        border-left: 2px solid #fff;
-        border-right: 2px solid #404040;
-        border-bottom: 2px solid #404040;
-        margin-top: 6px;
-        padding: 6px;
-        font-weight: bold;
-    }
-    QGroupBox::title { subcontrol-origin: margin; left: 6px; }
     QSpinBox {
         background: #fff;
         border-top: 2px solid #808080;
@@ -65,6 +59,14 @@ WIN2K = """
         border-bottom: 2px solid #fff;
         padding: 1px 4px;
         min-width: 50px;
+    }
+    QLineEdit {
+        background: #fff;
+        border-top: 2px solid #808080;
+        border-left: 2px solid #808080;
+        border-right: 2px solid #fff;
+        border-bottom: 2px solid #fff;
+        padding: 2px 4px;
     }
     QTableWidget {
         background: #fff;
@@ -90,6 +92,8 @@ WIN2K = """
         border-bottom: 2px solid #fff;
     }
     QListWidget::item:selected { background: #000080; color: #fff; }
+    QDialog { background: #d4d0c8; }
+    QLabel { background: transparent; }
     QScrollBar:vertical {
         background: #d4d0c8;
         width: 16px;
@@ -111,10 +115,6 @@ WIN2K = """
         border-right: 2px solid #404040;
         border-bottom: 2px solid #404040;
     }
-    QDialog {
-        background: #d4d0c8;
-    }
-    QLabel { background: transparent; }
 """
 
 sensors = {}
@@ -142,6 +142,8 @@ def hr_callback(sid, signal):
     return callback
 
 async def connect_ble(sid, address, signal):
+    if sid not in sensors:
+        return
     sensors[sid]["status"] = "connecting"
     signal.emit(sid, 0)
     try:
@@ -152,7 +154,7 @@ async def connect_ble(sid, address, signal):
         sensors[sid]["status"] = "connected"
         signal.emit(sid, sensors[sid]["hr"])
         await client.start_notify(HEART_RATE_UUID, hr_callback(sid, signal))
-        while sensors[sid]["connected"]:
+        while sensors[sid].get("connected"):
             if not client.is_connected:
                 break
             await asyncio.sleep(1)
@@ -169,11 +171,14 @@ async def connect_ble(sid, address, signal):
         sensors[sid]["hr"] = 0
     if sid in clients:
         del clients[sid]
-    signal.emit(sid, 0)
+    if sid in sensors:
+        signal.emit(sid, 0)
 
 async def disconnect_ble(sid):
     if sid in sensors:
         sensors[sid]["connected"] = False
+        sensors[sid]["status"] = "disconnected"
+        sensors[sid]["hr"] = 0
     client = clients.get(sid)
     if client:
         try:
@@ -183,22 +188,20 @@ async def disconnect_ble(sid):
             pass
         if sid in clients:
             del clients[sid]
-    if sid in sensors:
-        sensors[sid]["status"] = "disconnected"
-        sensors[sid]["hr"] = 0
 
 class Signals(QObject):
     hr_updated = pyqtSignal(int, int)
     scan_done = pyqtSignal(list)
+    sensor_renamed = pyqtSignal(int, str)
 
 signals = Signals()
 
 class EcgWidget(QWidget):
     HISTORY = 150
 
-    def __init__(self, sensor_id, parent=None):
+    def __init__(self, sid, parent=None):
         super().__init__(parent)
-        self.sid = sensor_id
+        self.sid = sid
         self.history = [0] * self.HISTORY
         self.setMinimumHeight(80)
 
@@ -215,11 +218,9 @@ class EcgWidget(QWidget):
 
         painter.setPen(QPen(QColor(0, 26, 0), 1))
         for i in range(1, 10):
-            x = int(W * i / 10)
-            painter.drawLine(x, 0, x, H)
+            painter.drawLine(int(W * i / 10), 0, int(W * i / 10), H)
         for i in range(1, 5):
-            y = int(H * i / 5)
-            painter.drawLine(0, y, W, y)
+            painter.drawLine(0, int(H * i / 5), W, int(H * i / 5))
 
         s = sensors.get(self.sid, {})
         if not s.get("connected"):
@@ -235,38 +236,28 @@ class EcgWidget(QWidget):
         mn = min(vals) - 10
         mx = max(vals) + 10
         rng = max(mx - mn, 20)
+        step = W / (self.HISTORY - 1)
 
-        for glow in [(QColor(0,255,0,20), 6), (QColor(0,255,0,60), 3), (QColor(0,255,0,255), 1)]:
-            pen = QPen(glow[0], glow[1])
+        for color, width in [(QColor(0,255,0,20), 6), (QColor(0,255,0,60), 3), (QColor(0,255,0,255), 1)]:
+            pen = QPen(color, width)
             pen.setCapStyle(Qt.PenCapStyle.RoundCap)
             pen.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
             painter.setPen(pen)
-            step = W / (self.HISTORY - 1)
-            path_pts = []
+            pts = []
             for i, v in enumerate(self.history):
                 hr = v if v > 0 else (mn + rng / 2)
                 x = int(i * step)
                 y = int(H - ((hr - mn) / rng) * H * 0.8 - H * 0.1)
-                path_pts.append((x, y))
-            for i in range(1, len(path_pts)):
-                painter.drawLine(path_pts[i-1][0], path_pts[i-1][1],
-                                 path_pts[i][0], path_pts[i][1])
+                pts.append((x, y))
+            for i in range(1, len(pts)):
+                painter.drawLine(pts[i-1][0], pts[i-1][1], pts[i][0], pts[i][1])
         painter.end()
 
 class SensorCard(QFrame):
     def __init__(self, sid, parent=None):
         super().__init__(parent)
         self.sid = sid
-        self.setFrameStyle(QFrame.Shape.Box)
-        self.setStyleSheet("""
-            QFrame {
-                background: #d4d0c8;
-                border-top: 2px solid #fff;
-                border-left: 2px solid #fff;
-                border-right: 2px solid #404040;
-                border-bottom: 2px solid #404040;
-            }
-        """)
+        self._set_style(False)
         layout = QVBoxLayout(self)
         layout.setSpacing(2)
         layout.setContentsMargins(6, 6, 6, 6)
@@ -304,6 +295,18 @@ class SensorCard(QFrame):
         layout.addWidget(self.status_label)
         layout.addLayout(btn_row)
 
+    def _set_style(self, connected):
+        bg = "#f0f4f0" if connected else "#d4d0c8"
+        self.setStyleSheet(f"""
+            QFrame {{
+                background: {bg};
+                border-top: 2px solid #fff;
+                border-left: 2px solid #fff;
+                border-right: 2px solid #404040;
+                border-bottom: 2px solid #404040;
+            }}
+        """)
+
     def toggle_connection(self):
         s = sensors.get(self.sid, {})
         if s.get("connected"):
@@ -311,10 +314,14 @@ class SensorCard(QFrame):
         else:
             run_ble(connect_ble(self.sid, s["address"], signals.hr_updated))
 
+    def update_name(self, name):
+        self.name_label.setText(name)
+
     def update_display(self):
         s = sensors.get(self.sid, {})
         if not s:
             return
+        self.name_label.setText(s["name"])
         if s.get("connected"):
             self.hr_label.setText(str(s["hr"]))
             self.hr_label.setStyleSheet("color: #800000;")
@@ -322,21 +329,14 @@ class SensorCard(QFrame):
             self.status_label.setText("Подключен")
             self.status_label.setStyleSheet("color: #006400; font-size: 10px;")
             self.conn_btn.setText("Откл")
-            self.setStyleSheet("""
-                QFrame {
-                    background: #f0f4f0;
-                    border-top: 2px solid #fff;
-                    border-left: 2px solid #fff;
-                    border-right: 2px solid #404040;
-                    border-bottom: 2px solid #404040;
-                }
-            """)
+            self._set_style(True)
         elif s.get("status") == "connecting":
             self.hr_label.setText("---")
             self.hr_label.setStyleSheet("color: #808000;")
             self.status_label.setText("Подключение...")
             self.status_label.setStyleSheet("color: #808000; font-size: 10px;")
             self.conn_btn.setText("Откл")
+            self._set_style(False)
         else:
             self.hr_label.setText("---")
             self.hr_label.setStyleSheet("color: #808080;")
@@ -344,43 +344,125 @@ class SensorCard(QFrame):
             self.status_label.setText("Отключен")
             self.status_label.setStyleSheet("color: #808080; font-size: 10px;")
             self.conn_btn.setText("Подкл")
-            self.setStyleSheet("""
-                QFrame {
-                    background: #d4d0c8;
-                    border-top: 2px solid #fff;
-                    border-left: 2px solid #fff;
-                    border-right: 2px solid #404040;
-                    border-bottom: 2px solid #404040;
-                }
-            """)
+            self._set_style(False)
+
+class AddSensorDialog(QDialog):
+    def __init__(self, device_info, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Добавить датчик")
+        self.setFixedSize(320, 180)
+        self.setStyleSheet(WIN2K)
+        self.device_info = device_info
+        self.result_name = None
+
+        layout = QVBoxLayout(self)
+        layout.setSpacing(8)
+        layout.setContentsMargins(12, 12, 12, 12)
+
+        info_lbl = QLabel(f"Устройство: {device_info['name']}\nАдрес: {device_info['address']}")
+        info_lbl.setStyleSheet("color: #000; font-size: 11px;")
+        layout.addWidget(info_lbl)
+
+        sep = QFrame()
+        sep.setFrameShape(QFrame.Shape.HLine)
+        sep.setStyleSheet("border-top: 1px solid #808080; border-bottom: 1px solid #fff;")
+        layout.addWidget(sep)
+
+        name_lbl = QLabel("Введите имя датчика (например: ips1, dge2):")
+        layout.addWidget(name_lbl)
+
+        self.name_input = QLineEdit()
+        self.name_input.setPlaceholderText("Имя датчика...")
+        self.name_input.setText(device_info.get("name", ""))
+        layout.addWidget(self.name_input)
+
+        btn_row = QHBoxLayout()
+        ok_btn = QPushButton("Добавить")
+        ok_btn.clicked.connect(self.on_ok)
+        cancel_btn = QPushButton("Отмена")
+        cancel_btn.clicked.connect(self.reject)
+        btn_row.addStretch()
+        btn_row.addWidget(ok_btn)
+        btn_row.addWidget(cancel_btn)
+        layout.addLayout(btn_row)
+
+    def on_ok(self):
+        name = self.name_input.text().strip()
+        if not name:
+            QMessageBox.warning(self, "Ошибка", "Введите имя датчика!")
+            return
+        self.result_name = name
+        self.accept()
+
+class RenameDialog(QDialog):
+    def __init__(self, sid, parent=None):
+        super().__init__(parent)
+        self.sid = sid
+        self.setWindowTitle("Переименовать датчик")
+        self.setFixedSize(300, 140)
+        self.setStyleSheet(WIN2K)
+        self.result_name = None
+
+        s = sensors[sid]
+        layout = QVBoxLayout(self)
+        layout.setSpacing(8)
+        layout.setContentsMargins(12, 12, 12, 12)
+
+        info_lbl = QLabel(f"Датчик: {s['name']}\nАдрес: {s['address']}")
+        layout.addWidget(info_lbl)
+
+        self.name_input = QLineEdit()
+        self.name_input.setText(s["name"])
+        layout.addWidget(self.name_input)
+
+        btn_row = QHBoxLayout()
+        ok_btn = QPushButton("Переименовать")
+        ok_btn.clicked.connect(self.on_ok)
+        cancel_btn = QPushButton("Отмена")
+        cancel_btn.clicked.connect(self.reject)
+        btn_row.addStretch()
+        btn_row.addWidget(ok_btn)
+        btn_row.addWidget(cancel_btn)
+        layout.addLayout(btn_row)
+
+    def on_ok(self):
+        name = self.name_input.text().strip()
+        if not name:
+            QMessageBox.warning(self, "Ошибка", "Введите имя!")
+            return
+        self.result_name = name
+        self.accept()
 
 class DeviceDialog(QDialog):
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setWindowTitle("Управление датчиками")
-        self.setMinimumSize(420, 380)
+        self.setMinimumSize(480, 420)
         self.setStyleSheet(WIN2K)
-        self.scan_results = []
 
         layout = QVBoxLayout(self)
+        layout.setSpacing(6)
+        layout.setContentsMargins(10, 10, 10, 10)
 
-        scan_label = QLabel("Поиск устройств Bluetooth:")
-        scan_label.setFont(QFont("Tahoma", 9, QFont.Weight.Bold))
-        layout.addWidget(scan_label)
+        scan_lbl = QLabel("Поиск устройств Bluetooth:")
+        scan_lbl.setFont(QFont("Tahoma", 9, QFont.Weight.Bold))
+        layout.addWidget(scan_lbl)
 
+        scan_row = QHBoxLayout()
         self.scan_btn = QPushButton("Начать поиск")
         self.scan_btn.clicked.connect(self.start_scan)
-        layout.addWidget(self.scan_btn)
-
         self.scan_status = QLabel("Нажмите 'Начать поиск'")
         self.scan_status.setStyleSheet("color: #808080;")
-        layout.addWidget(self.scan_status)
+        scan_row.addWidget(self.scan_btn)
+        scan_row.addWidget(self.scan_status)
+        scan_row.addStretch()
+        layout.addLayout(scan_row)
 
         self.scan_list = QListWidget()
         self.scan_list.setMinimumHeight(130)
         layout.addWidget(self.scan_list)
 
-        add_btn = QPushButton("Добавить выбранное")
+        add_btn = QPushButton("Добавить выбранное устройство")
         add_btn.clicked.connect(self.add_selected)
         layout.addWidget(add_btn)
 
@@ -389,19 +471,22 @@ class DeviceDialog(QDialog):
         sep.setStyleSheet("border-top: 1px solid #808080; border-bottom: 1px solid #fff;")
         layout.addWidget(sep)
 
-        added_label = QLabel("Добавленные датчики:")
-        added_label.setFont(QFont("Tahoma", 9, QFont.Weight.Bold))
-        layout.addWidget(added_label)
+        added_lbl = QLabel("Добавленные датчики:")
+        added_lbl.setFont(QFont("Tahoma", 9, QFont.Weight.Bold))
+        layout.addWidget(added_lbl)
 
         self.added_list = QListWidget()
-        self.added_list.setMaximumHeight(100)
+        self.added_list.setMinimumHeight(100)
         layout.addWidget(self.added_list)
 
         btn_row = QHBoxLayout()
-        remove_btn = QPushButton("Удалить выбранный")
+        rename_btn = QPushButton("Переименовать")
+        rename_btn.clicked.connect(self.rename_selected)
+        remove_btn = QPushButton("Удалить")
         remove_btn.clicked.connect(self.remove_selected)
         close_btn = QPushButton("Закрыть")
         close_btn.clicked.connect(self.accept)
+        btn_row.addWidget(rename_btn)
         btn_row.addWidget(remove_btn)
         btn_row.addStretch()
         btn_row.addWidget(close_btn)
@@ -417,12 +502,11 @@ class DeviceDialog(QDialog):
         if BLE_AVAILABLE:
             run_ble(self.do_scan())
         else:
-            fake = [
+            signals.scan_done.emit([
                 {"name": "XOSS Pro 1", "address": "AA:BB:CC:DD:EE:01", "rssi": -55},
                 {"name": "XOSS Pro 2", "address": "AA:BB:CC:DD:EE:02", "rssi": -63},
                 {"name": "XOSS Pro 3", "address": "AA:BB:CC:DD:EE:03", "rssi": -71},
-            ]
-            signals.scan_done.emit(fake)
+            ])
 
     async def do_scan(self):
         results = []
@@ -443,7 +527,6 @@ class DeviceDialog(QDialog):
         signals.scan_done.emit(results)
 
     def on_scan_done(self, results):
-        self.scan_results = results
         self.scan_list.clear()
         self.scan_btn.setEnabled(True)
         if not results:
@@ -467,19 +550,49 @@ class DeviceDialog(QDialog):
     def add_selected(self):
         item = self.scan_list.currentItem()
         if not item:
+            QMessageBox.information(self, "Выбор", "Выберите устройство из списка!")
             return
         d = item.data(Qt.ItemDataRole.UserRole)
-        sid = len(sensors)
-        sensors[sid] = {
-            "id": sid,
-            "name": d["name"],
-            "address": d["address"],
-            "hr": 0,
-            "connected": False,
-            "status": "disconnected"
-        }
-        run_ble(connect_ble(sid, d["address"], signals.hr_updated))
-        self.refresh_added()
+        dlg = AddSensorDialog(d, self)
+        if dlg.exec() == QDialog.DialogCode.Accepted:
+            sid = max(sensors.keys(), default=-1) + 1
+            sensors[sid] = {
+                "id": sid,
+                "name": dlg.result_name,
+                "address": d["address"],
+                "hr": 0,
+                "connected": False,
+                "status": "disconnected"
+            }
+            run_ble(connect_ble(sid, d["address"], signals.hr_updated))
+            self.refresh_added()
+
+    def rename_selected(self):
+        item = self.added_list.currentItem()
+        if not item:
+            QMessageBox.information(self, "Выбор", "Выберите датчик из списка!")
+            return
+        sid = item.data(Qt.ItemDataRole.UserRole)
+        if sid not in sensors:
+            return
+        dlg = RenameDialog(sid, self)
+        if dlg.exec() == QDialog.DialogCode.Accepted:
+            old_name = sensors[sid]["name"]
+            new_name = dlg.result_name
+            sensors[sid]["name"] = new_name
+            self.rename_txt_file(old_name, new_name)
+            signals.sensor_renamed.emit(sid, new_name)
+            self.refresh_added()
+
+    def rename_txt_file(self, old_name, new_name):
+        folder = os.path.dirname(os.path.abspath(sys.argv[0]))
+        old_path = os.path.join(folder, f"{old_name}.txt")
+        new_path = os.path.join(folder, f"{new_name}.txt")
+        if os.path.exists(old_path):
+            try:
+                os.rename(old_path, new_path)
+            except Exception:
+                pass
 
     def remove_selected(self):
         item = self.added_list.currentItem()
@@ -490,6 +603,7 @@ class DeviceDialog(QDialog):
             run_ble(disconnect_ble(sid))
             del sensors[sid]
         self.refresh_added()
+        signals.sensor_renamed.emit(-1, "")
 
     def refresh_added(self):
         self.added_list.clear()
@@ -503,22 +617,16 @@ class MonitorWindow(QWidget):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("Монитор пульса — XOSS Heart Monitor")
+        icon_path = resource_path("icon.ico")
+        if os.path.exists(icon_path):
+            self.setWindowIcon(QIcon(icon_path))
         self.setStyleSheet("background: #000;")
         self.setMinimumSize(800, 500)
         self.ecg_widgets = {}
         self.hr_labels = {}
         self.status_labels = {}
+        self.name_labels = {}
         self.cards = {}
-
-        self.scroll = QScrollArea(self)
-        self.scroll.setWidgetResizable(True)
-        self.scroll.setStyleSheet("background: #000; border: none;")
-        self.inner = QWidget()
-        self.inner.setStyleSheet("background: #000;")
-        self.grid = QGridLayout(self.inner)
-        self.grid.setSpacing(6)
-        self.grid.setContentsMargins(6, 6, 6, 6)
-        self.scroll.setWidget(self.inner)
 
         main_layout = QVBoxLayout(self)
         main_layout.setContentsMargins(0, 0, 0, 0)
@@ -540,15 +648,25 @@ class MonitorWindow(QWidget):
         h_layout.addWidget(self.header_status)
         h_layout.addSpacing(20)
         h_layout.addWidget(self.header_time)
-
         main_layout.addWidget(header)
+
+        self.scroll = QScrollArea()
+        self.scroll.setWidgetResizable(True)
+        self.scroll.setStyleSheet("background: #000; border: none;")
+        self.inner = QWidget()
+        self.inner.setStyleSheet("background: #000;")
+        self.grid = QGridLayout(self.inner)
+        self.grid.setSpacing(6)
+        self.grid.setContentsMargins(6, 6, 6, 6)
+        self.scroll.setWidget(self.inner)
         main_layout.addWidget(self.scroll)
 
         signals.hr_updated.connect(self.on_hr_updated)
+        signals.sensor_renamed.connect(self.on_sensor_renamed)
 
-        self.timer = QTimer()
-        self.timer.timeout.connect(self.refresh_layout)
-        self.timer.start(1000)
+        self.refresh_timer = QTimer()
+        self.refresh_timer.timeout.connect(self.refresh_layout)
+        self.refresh_timer.start(1000)
 
         self.time_timer = QTimer()
         self.time_timer.timeout.connect(self.update_time)
@@ -576,6 +694,11 @@ class MonitorWindow(QWidget):
                     self.status_labels[sid].setStyleSheet("color: #003300; font-size: 10px; background: transparent;")
         self.update_header()
 
+    def on_sensor_renamed(self, sid, new_name):
+        if sid in self.name_labels:
+            self.name_labels[sid].setText(new_name)
+        self.refresh_layout()
+
     def update_header(self):
         total = len(sensors)
         connected = sum(1 for s in sensors.values() if s.get("connected"))
@@ -592,7 +715,6 @@ class MonitorWindow(QWidget):
     def refresh_layout(self):
         current_ids = set(sensors.keys())
         widget_ids = set(self.cards.keys())
-
         for sid in widget_ids - current_ids:
             card = self.cards.pop(sid)
             self.grid.removeWidget(card)
@@ -600,10 +722,9 @@ class MonitorWindow(QWidget):
             self.ecg_widgets.pop(sid, None)
             self.hr_labels.pop(sid, None)
             self.status_labels.pop(sid, None)
-
+            self.name_labels.pop(sid, None)
         for sid in current_ids - widget_ids:
             self.add_monitor_card(sid)
-
         self.update_header()
 
     def add_monitor_card(self, sid):
@@ -646,30 +767,32 @@ class MonitorWindow(QWidget):
         info_layout.addStretch()
 
         ecg = EcgWidget(sid)
-        ecg.setMinimumHeight(80)
-
         card_layout.addWidget(info)
         card_layout.addWidget(ecg)
 
         n = len(self.cards)
-        row, col = n // 2, n % 2
-        self.grid.addWidget(card, row, col)
+        self.grid.addWidget(card, n // 2, n % 2)
 
         self.cards[sid] = card
         self.ecg_widgets[sid] = ecg
         self.hr_labels[sid] = hr_lbl
         self.status_labels[sid] = status_lbl
+        self.name_labels[sid] = name_lbl
 
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("XOSS Heart Monitor — Studio Amateur")
+        icon_path = resource_path("icon.ico")
+        if os.path.exists(icon_path):
+            self.setWindowIcon(QIcon(icon_path))
         self.setMinimumSize(900, 600)
         self.setStyleSheet(WIN2K)
 
         self.log_data = []
         self.logging_active = False
         self.log_interval = 1
+        self.csv_filename = ""
         self.monitor_window = None
         self.sensor_cards = {}
 
@@ -686,18 +809,23 @@ class MainWindow(QMainWindow):
                 border-left: 2px solid #fff;
                 border-right: 2px solid #404040;
                 border-bottom: 2px solid #404040;
-                background: #d4d0c8;
             }
         """)
         ctrl_layout = QHBoxLayout(ctrl_frame)
         ctrl_layout.setContentsMargins(6, 6, 6, 6)
         ctrl_layout.setSpacing(4)
 
+        def vsep():
+            f = QFrame()
+            f.setFrameShape(QFrame.Shape.VLine)
+            f.setStyleSheet("border-left: 1px solid #808080; border-right: 1px solid #fff; max-width: 2px;")
+            return f
+
         self.manage_btn = QPushButton("Управление датчиками")
         self.manage_btn.clicked.connect(self.open_device_dialog)
         self.log_btn = QPushButton("Начать запись")
         self.log_btn.clicked.connect(self.toggle_log)
-        interval_label = QLabel("Интервал (сек):")
+        interval_lbl = QLabel("Интервал (сек):")
         self.interval_spin = QSpinBox()
         self.interval_spin.setRange(1, 60)
         self.interval_spin.setValue(1)
@@ -705,19 +833,13 @@ class MainWindow(QMainWindow):
         self.monitor_btn = QPushButton("Открыть монитор")
         self.monitor_btn.clicked.connect(self.open_monitor)
 
-        def sep():
-            f = QFrame()
-            f.setFrameShape(QFrame.Shape.VLine)
-            f.setStyleSheet("border-left: 1px solid #808080; border-right: 1px solid #fff; max-width: 2px;")
-            return f
-
         ctrl_layout.addWidget(self.manage_btn)
-        ctrl_layout.addWidget(sep())
+        ctrl_layout.addWidget(vsep())
         ctrl_layout.addWidget(self.log_btn)
-        ctrl_layout.addWidget(sep())
-        ctrl_layout.addWidget(interval_label)
+        ctrl_layout.addWidget(vsep())
+        ctrl_layout.addWidget(interval_lbl)
         ctrl_layout.addWidget(self.interval_spin)
-        ctrl_layout.addWidget(sep())
+        ctrl_layout.addWidget(vsep())
         ctrl_layout.addWidget(self.monitor_btn)
         ctrl_layout.addStretch()
         main_layout.addWidget(ctrl_frame)
@@ -729,21 +851,19 @@ class MainWindow(QMainWindow):
                 border-left: 2px solid #fff;
                 border-right: 2px solid #404040;
                 border-bottom: 2px solid #404040;
-                background: #d4d0c8;
             }
         """)
         sensors_v = QVBoxLayout(sensors_frame)
         sensors_v.setContentsMargins(6, 6, 6, 6)
-        lbl = QLabel("Датчики")
-        lbl.setFont(QFont("Tahoma", 9, QFont.Weight.Bold))
-        lbl.setStyleSheet("border-bottom: 1px solid #808080; padding-bottom: 2px;")
-        sensors_v.addWidget(lbl)
+        s_lbl = QLabel("Датчики")
+        s_lbl.setFont(QFont("Tahoma", 9, QFont.Weight.Bold))
+        s_lbl.setStyleSheet("border-bottom: 1px solid #808080; padding-bottom: 2px;")
+        sensors_v.addWidget(s_lbl)
 
         self.sensors_scroll = QScrollArea()
         self.sensors_scroll.setWidgetResizable(True)
         self.sensors_scroll.setStyleSheet("background: #d4d0c8; border: none;")
         self.sensors_inner = QWidget()
-        self.sensors_inner.setStyleSheet("background: #d4d0c8;")
         self.sensors_grid = QGridLayout(self.sensors_inner)
         self.sensors_grid.setSpacing(6)
         self.sensors_grid.setContentsMargins(0, 0, 0, 0)
@@ -762,7 +882,6 @@ class MainWindow(QMainWindow):
                 border-left: 2px solid #fff;
                 border-right: 2px solid #404040;
                 border-bottom: 2px solid #404040;
-                background: #d4d0c8;
             }
         """)
         log_v = QVBoxLayout(log_frame)
@@ -782,6 +901,7 @@ class MainWindow(QMainWindow):
         main_layout.addWidget(log_frame, 1)
 
         signals.hr_updated.connect(self.on_hr_updated)
+        signals.sensor_renamed.connect(self.on_sensor_renamed)
 
         self.refresh_timer = QTimer()
         self.refresh_timer.timeout.connect(self.refresh_sensor_cards)
@@ -803,6 +923,7 @@ class MainWindow(QMainWindow):
 
         if not sensors:
             self.empty_label.show()
+            self.update_log_table_headers()
             return
         self.empty_label.hide()
 
@@ -811,8 +932,7 @@ class MainWindow(QMainWindow):
             card = SensorCard(sid)
             card.remove_btn.clicked.connect(lambda _, x=sid: self.remove_sensor(x))
             self.sensor_cards[sid] = card
-            row, col = i // cols, i % cols
-            self.sensors_grid.addWidget(card, row, col)
+            self.sensors_grid.addWidget(card, i // cols, i % cols)
 
         self.update_log_table_headers()
 
@@ -823,12 +943,18 @@ class MainWindow(QMainWindow):
         self.rebuild_sensor_grid()
 
     def refresh_sensor_cards(self):
-        for sid, card in self.sensor_cards.items():
+        for card in self.sensor_cards.values():
             card.update_display()
 
     def on_hr_updated(self, sid, hr):
         if sid in self.sensor_cards:
             self.sensor_cards[sid].update_display()
+
+    def on_sensor_renamed(self, sid, new_name):
+        if sid in self.sensor_cards:
+            self.sensor_cards[sid].update_display()
+        self.update_log_table_headers()
+        self.rebuild_sensor_grid()
 
     def toggle_log(self):
         if not self.logging_active:
@@ -862,9 +988,10 @@ class MainWindow(QMainWindow):
         now = datetime.now()
         row = [now.strftime("%d.%m.%Y"), now.strftime("%H:%M:%S")]
         row += [sensors[i]["hr"] if sensors[i]["connected"] else "" for i in ids]
-        with open(self.csv_filename, "a", newline="", encoding="utf-8-sig") as f:
-            writer = csv.writer(f, delimiter=";")
-            writer.writerow(row)
+        if self.csv_filename:
+            with open(self.csv_filename, "a", newline="", encoding="utf-8-sig") as f:
+                writer = csv.writer(f, delimiter=";")
+                writer.writerow(row)
         self.log_data.append(row)
         if len(self.log_data) > 50:
             self.log_data.pop(0)
@@ -903,6 +1030,9 @@ class MainWindow(QMainWindow):
 if __name__ == "__main__":
     app = QApplication(sys.argv)
     app.setStyle("Windows")
+    icon_path = resource_path("icon.ico")
+    if os.path.exists(icon_path):
+        app.setWindowIcon(QIcon(icon_path))
     window = MainWindow()
     window.show()
     sys.exit(app.exec())
