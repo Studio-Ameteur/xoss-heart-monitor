@@ -132,11 +132,37 @@ def get_ble_loop():
 def run_ble(coro):
     return asyncio.run_coroutine_threadsafe(coro, get_ble_loop())
 
+def parse_hr_measurement(data: bytes) -> int:
+    """
+    Parse Heart Rate Measurement characteristic (0x2A37).
+    Supports all standard BLE HR sensor formats:
+      - 8-bit or 16-bit HR value
+      - with or without Energy Expended
+      - with or without RR intervals
+    Returns heart rate as integer, or 0 on error.
+    """
+    if not data or len(data) < 2:
+        return 0
+    flags = data[0]
+    hr_format_16bit = flags & 0x01  # bit 0: 0=uint8, 1=uint16
+    try:
+        if hr_format_16bit:
+            if len(data) < 3:
+                return 0
+            hr = int.from_bytes(data[1:3], "little")
+        else:
+            hr = data[1]
+    except Exception:
+        return 0
+    # Sanity check: valid HR range 20-250 bpm
+    if hr < 20 or hr > 250:
+        return 0
+    return hr
+
 def hr_callback(sid, signal):
     def callback(sender, data):
-        flags = data[0]
-        hr = int.from_bytes(data[1:3], "little") if flags & 0x01 else data[1]
-        if sid in sensors:
+        hr = parse_hr_measurement(bytes(data))
+        if hr > 0 and sid in sensors:
             sensors[sid]["hr"] = hr
             signal.emit(sid, hr)
     return callback
@@ -161,7 +187,7 @@ async def connect_ble(sid, address, signal):
         try:
             await client.stop_notify(HEART_RATE_UUID)
             await client.disconnect()
-        except:
+        except Exception:
             pass
     except Exception:
         pass
@@ -184,7 +210,7 @@ async def disconnect_ble(sid):
         try:
             await client.stop_notify(HEART_RATE_UUID)
             await client.disconnect()
-        except:
+        except Exception:
             pass
         if sid in clients:
             del clients[sid]
@@ -508,30 +534,31 @@ class DeviceDialog(QDialog):
                 {"name": "XOSS Pro 3", "address": "AA:BB:CC:DD:EE:03", "rssi": -71},
             ])
 
-async def do_scan(self):
-    results = []
-    try:
-        devices = await BleakScanner.discover(timeout=6.0)
-        hr_keywords = [
-            "XOSS", "HR", "HEART", "POLAR", "WAHOO", "GARMIN",
-            "SUUNTO", "COROS", "MAGENE", "SCOSCHE", "WHOOP",
-            "FITBIT", "XIAOMI", "HUAWEI", "SAMSUNG", "AMAZFIT",
-            "BRYTON", "PULSE", "CARDIO"
-        ]
-        priority, other = [], []
-        for d in devices:
-            name = d.name or "Без имени"
-            rssi = getattr(d, "rssi", None)
-            entry = {"name": name, "address": d.address, "rssi": rssi}
-            if any(k in name.upper() for k in hr_keywords):
-                priority.append(entry)
-            else:
-                other.append(entry)
-        results = priority + other
-    except Exception:
-        pass
-    signals.scan_done.emit(results)
-    
+    # FIX: do_scan is now correctly indented as a method of DeviceDialog
+    async def do_scan(self):
+        results = []
+        try:
+            devices = await BleakScanner.discover(timeout=6.0)
+            hr_keywords = [
+                "XOSS", "HR", "HEART", "POLAR", "WAHOO", "GARMIN",
+                "SUUNTO", "COROS", "MAGENE", "SCOSCHE", "WHOOP",
+                "FITBIT", "XIAOMI", "HUAWEI", "SAMSUNG", "AMAZFIT",
+                "BRYTON", "PULSE", "CARDIO"
+            ]
+            priority, other = [], []
+            for d in devices:
+                name = d.name or "Без имени"
+                rssi = getattr(d, "rssi", None)
+                entry = {"name": name, "address": d.address, "rssi": rssi}
+                if any(k in name.upper() for k in hr_keywords):
+                    priority.append(entry)
+                else:
+                    other.append(entry)
+            results = priority + other
+        except Exception:
+            pass
+        signals.scan_done.emit(results)
+
     def on_scan_done(self, results):
         self.scan_list.clear()
         self.scan_btn.setEnabled(True)
