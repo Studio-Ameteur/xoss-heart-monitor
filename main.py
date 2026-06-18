@@ -508,24 +508,30 @@ class DeviceDialog(QDialog):
                 {"name": "XOSS Pro 3", "address": "AA:BB:CC:DD:EE:03", "rssi": -71},
             ])
 
-    async def do_scan(self):
-        results = []
-        try:
-            devices = await BleakScanner.discover(timeout=6.0)
-            xoss, other = [], []
-            for d in devices:
-                name = d.name or "Без имени"
-                rssi = getattr(d, "rssi", None)
-                entry = {"name": name, "address": d.address, "rssi": rssi}
-                if any(k in name.upper() for k in ["XOSS","HR","HEART","POLAR","WAHOO","GARMIN"]):
-                    xoss.append(entry)
-                else:
-                    other.append(entry)
-            results = xoss + other
-        except Exception:
-            pass
-        signals.scan_done.emit(results)
-
+async def do_scan(self):
+    results = []
+    try:
+        devices = await BleakScanner.discover(timeout=6.0)
+        hr_keywords = [
+            "XOSS", "HR", "HEART", "POLAR", "WAHOO", "GARMIN",
+            "SUUNTO", "COROS", "MAGENE", "SCOSCHE", "WHOOP",
+            "FITBIT", "XIAOMI", "HUAWEI", "SAMSUNG", "AMAZFIT",
+            "BRYTON", "PULSE", "CARDIO"
+        ]
+        priority, other = [], []
+        for d in devices:
+            name = d.name or "Без имени"
+            rssi = getattr(d, "rssi", None)
+            entry = {"name": name, "address": d.address, "rssi": rssi}
+            if any(k in name.upper() for k in hr_keywords):
+                priority.append(entry)
+            else:
+                other.append(entry)
+        results = priority + other
+    except Exception:
+        pass
+    signals.scan_done.emit(results)
+    
     def on_scan_done(self, results):
         self.scan_list.clear()
         self.scan_btn.setEnabled(True)
