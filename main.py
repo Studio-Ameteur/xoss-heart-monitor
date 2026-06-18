@@ -543,7 +543,7 @@ class DeviceDialog(QDialog):
                 "XOSS", "HR", "HEART", "POLAR", "WAHOO", "GARMIN",
                 "SUUNTO", "COROS", "MAGENE", "SCOSCHE", "WHOOP",
                 "FITBIT", "XIAOMI", "HUAWEI", "SAMSUNG", "AMAZFIT",
-                "BRYTON", "PULSE", "CARDIO"
+                "BRYTON", "PULSE", "CARDIO", "COOSPO"
             ]
             priority, other = [], []
             for d in devices:
