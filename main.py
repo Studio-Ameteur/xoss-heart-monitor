@@ -4,6 +4,8 @@ import asyncio
 import time
 import csv
 import os
+import json
+import colorsys
 from datetime import datetime
 
 from PyQt6.QtWidgets import (
@@ -22,6 +24,9 @@ except ImportError:
     BLE_AVAILABLE = False
 
 HEART_RATE_UUID = "00002a37-0000-1000-8000-00805f9b34fb"
+BATTERY_LEVEL_UUID = "00002a19-0000-1000-8000-00805f9b34fb"
+RECONNECT_DELAY_SEC = 5
+BATTERY_POLL_TICKS = 30
 
 def resource_path(relative_path):
     if hasattr(sys, '_MEIPASS'):
@@ -121,6 +126,39 @@ sensors = {}
 ble_loop = None
 clients = {}
 
+def config_path():
+    folder = os.path.dirname(os.path.abspath(sys.argv[0]))
+    return os.path.join(folder, "sensors_config.json")
+
+def save_sensors_config():
+    try:
+        data = [
+            {"name": s["name"], "address": s["address"], "color": s["color"]}
+            for s in sensors.values()
+        ]
+        with open(config_path(), "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+    except Exception:
+        pass
+
+def load_sensors_config():
+    path = config_path()
+    if not os.path.exists(path):
+        return []
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return []
+
+def next_sensor_id():
+    return max(sensors.keys(), default=-1) + 1
+
+def color_for_index(index):
+    hue = (index * 0.6180339887498949) % 1.0
+    r, g, b = colorsys.hsv_to_rgb(hue, 0.75, 1.0)
+    return QColor(int(r * 255), int(g * 255), int(b * 255)).name()
+
 def get_ble_loop():
     global ble_loop
     if ble_loop is None or not ble_loop.is_running():
@@ -167,48 +205,112 @@ def hr_callback(sid, signal):
             signal.emit(sid, hr)
     return callback
 
-async def connect_ble(sid, address, signal):
-    if sid not in sensors:
-        return
-    sensors[sid]["status"] = "connecting"
-    signal.emit(sid, 0)
+def battery_callback(sid, signal):
+    def callback(sender, data):
+        if data and sid in sensors:
+            level = data[0]
+            if 0 <= level <= 100:
+                sensors[sid]["battery"] = level
+                signal.emit(sid, level)
+    return callback
+
+async def try_read_battery(sid, client, signal):
     try:
-        client = BleakClient(address, timeout=10.0)
-        await client.connect()
-        clients[sid] = client
-        sensors[sid]["connected"] = True
-        sensors[sid]["status"] = "connected"
-        signal.emit(sid, sensors[sid]["hr"])
-        await client.start_notify(HEART_RATE_UUID, hr_callback(sid, signal))
-        while sensors[sid].get("connected"):
-            if not client.is_connected:
-                break
-            await asyncio.sleep(1)
-        try:
-            await client.stop_notify(HEART_RATE_UUID)
-            await client.disconnect()
-        except Exception:
-            pass
+        data = await client.read_gatt_char(BATTERY_LEVEL_UUID)
+        if data and sid in sensors:
+            level = data[0]
+            if 0 <= level <= 100:
+                sensors[sid]["battery"] = level
+                signal.emit(sid, level)
     except Exception:
         pass
-    if sid in sensors:
-        sensors[sid]["connected"] = False
-        sensors[sid]["status"] = "disconnected"
-        sensors[sid]["hr"] = 0
-    if sid in clients:
-        del clients[sid]
-    if sid in sensors:
+
+async def connect_ble(sid, address, signal, battery_signal, disconnect_signal):
+    while True:
+        if sid not in sensors:
+            return
+        if not sensors[sid].get("auto_reconnect", True):
+            return
+        sensors[sid]["status"] = "connecting"
         signal.emit(sid, 0)
+        try:
+            client = BleakClient(address, timeout=10.0)
+            await client.connect()
+            clients[sid] = client
+            sensors[sid]["connected"] = True
+            sensors[sid]["status"] = "connected"
+            sensors[sid]["reconnect_attempts"] = 0
+            signal.emit(sid, sensors[sid]["hr"])
+            await client.start_notify(HEART_RATE_UUID, hr_callback(sid, signal))
+            await try_read_battery(sid, client, battery_signal)
+            try:
+                await client.start_notify(BATTERY_LEVEL_UUID, battery_callback(sid, battery_signal))
+            except Exception:
+                pass
+            tick = 0
+            while sensors.get(sid, {}).get("connected"):
+                if not client.is_connected:
+                    break
+                await asyncio.sleep(1)
+                tick += 1
+                if tick % BATTERY_POLL_TICKS == 0:
+                    await try_read_battery(sid, client, battery_signal)
+            try:
+                await client.stop_notify(HEART_RATE_UUID)
+            except Exception:
+                pass
+            try:
+                await client.stop_notify(BATTERY_LEVEL_UUID)
+            except Exception:
+                pass
+            try:
+                await client.disconnect()
+            except Exception:
+                pass
+        except Exception:
+            pass
+
+        if sid in clients:
+            del clients[sid]
+        if sid not in sensors:
+            return
+
+        user_initiated = not sensors[sid].get("auto_reconnect", True)
+        sensors[sid]["connected"] = False
+        sensors[sid]["hr"] = 0
+        sensors[sid]["battery"] = None
+
+        if user_initiated:
+            sensors[sid]["status"] = "disconnected"
+            signal.emit(sid, 0)
+            return
+
+        was_reconnecting = sensors[sid].get("reconnect_attempts", 0) > 0
+        sensors[sid]["status"] = "reconnecting"
+        sensors[sid]["reconnect_attempts"] = sensors[sid].get("reconnect_attempts", 0) + 1
+        signal.emit(sid, 0)
+        if not was_reconnecting:
+            disconnect_signal.emit(sid, sensors[sid]["name"])
+        await asyncio.sleep(RECONNECT_DELAY_SEC)
 
 async def disconnect_ble(sid):
     if sid in sensors:
+        sensors[sid]["auto_reconnect"] = False
         sensors[sid]["connected"] = False
         sensors[sid]["status"] = "disconnected"
         sensors[sid]["hr"] = 0
+        sensors[sid]["battery"] = None
     client = clients.get(sid)
     if client:
         try:
             await client.stop_notify(HEART_RATE_UUID)
+        except Exception:
+            pass
+        try:
+            await client.stop_notify(BATTERY_LEVEL_UUID)
+        except Exception:
+            pass
+        try:
             await client.disconnect()
         except Exception:
             pass
@@ -219,6 +321,8 @@ class Signals(QObject):
     hr_updated = pyqtSignal(int, int)
     scan_done = pyqtSignal(list)
     sensor_renamed = pyqtSignal(int, str)
+    battery_updated = pyqtSignal(int, int)
+    sensor_disconnected = pyqtSignal(int, str)
 
 signals = Signals()
 
@@ -264,7 +368,13 @@ class EcgWidget(QWidget):
         rng = max(mx - mn, 20)
         step = W / (self.HISTORY - 1)
 
-        for color, width in [(QColor(0,255,0,20), 6), (QColor(0,255,0,60), 3), (QColor(0,255,0,255), 1)]:
+        base = QColor(s.get("color", "#00ff00"))
+        layers = [
+            (QColor(base.red(), base.green(), base.blue(), 20), 6),
+            (QColor(base.red(), base.green(), base.blue(), 60), 3),
+            (QColor(base.red(), base.green(), base.blue(), 255), 1),
+        ]
+        for color, width in layers:
             pen = QPen(color, width)
             pen.setCapStyle(Qt.PenCapStyle.RoundCap)
             pen.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
@@ -289,9 +399,16 @@ class SensorCard(QFrame):
         layout.setContentsMargins(6, 6, 6, 6)
 
         s = sensors[sid]
+        self.color = s.get("color", "#000080")
+
+        self.color_bar = QFrame()
+        self.color_bar.setFixedHeight(4)
+        self.color_bar.setStyleSheet(f"background: {self.color}; border: none;")
+
         self.name_label = QLabel(s["name"])
         self.name_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.name_label.setFont(QFont("Tahoma", 9, QFont.Weight.Bold))
+        self.name_label.setStyleSheet(f"color: {self.color};")
 
         self.hr_label = QLabel("---")
         self.hr_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
@@ -301,6 +418,10 @@ class SensorCard(QFrame):
         self.unit_label = QLabel("")
         self.unit_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.unit_label.setStyleSheet("color: #404040; font-size: 10px;")
+
+        self.battery_label = QLabel("")
+        self.battery_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.battery_label.setStyleSheet("color: #404040; font-size: 10px;")
 
         self.status_label = QLabel("Отключен")
         self.status_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
@@ -315,9 +436,11 @@ class SensorCard(QFrame):
         btn_row.addWidget(self.conn_btn)
         btn_row.addWidget(self.remove_btn)
 
+        layout.addWidget(self.color_bar)
         layout.addWidget(self.name_label)
         layout.addWidget(self.hr_label)
         layout.addWidget(self.unit_label)
+        layout.addWidget(self.battery_label)
         layout.addWidget(self.status_label)
         layout.addLayout(btn_row)
 
@@ -335,10 +458,11 @@ class SensorCard(QFrame):
 
     def toggle_connection(self):
         s = sensors.get(self.sid, {})
-        if s.get("connected"):
+        if s.get("connected") or s.get("status") in ("connecting", "reconnecting"):
             run_ble(disconnect_ble(self.sid))
         else:
-            run_ble(connect_ble(self.sid, s["address"], signals.hr_updated))
+            s["auto_reconnect"] = True
+            run_ble(connect_ble(self.sid, s["address"], signals.hr_updated, signals.battery_updated, signals.sensor_disconnected))
 
     def update_name(self, name):
         self.name_label.setText(name)
@@ -348,10 +472,13 @@ class SensorCard(QFrame):
         if not s:
             return
         self.name_label.setText(s["name"])
+        battery = s.get("battery")
+        battery_text = f"Заряд: {battery}%" if battery is not None else ""
         if s.get("connected"):
             self.hr_label.setText(str(s["hr"]))
             self.hr_label.setStyleSheet("color: #800000;")
             self.unit_label.setText("уд/мин")
+            self.battery_label.setText(battery_text)
             self.status_label.setText("Подключен")
             self.status_label.setStyleSheet("color: #006400; font-size: 10px;")
             self.conn_btn.setText("Откл")
@@ -359,14 +486,24 @@ class SensorCard(QFrame):
         elif s.get("status") == "connecting":
             self.hr_label.setText("---")
             self.hr_label.setStyleSheet("color: #808000;")
+            self.battery_label.setText("")
             self.status_label.setText("Подключение...")
             self.status_label.setStyleSheet("color: #808000; font-size: 10px;")
+            self.conn_btn.setText("Откл")
+            self._set_style(False)
+        elif s.get("status") == "reconnecting":
+            self.hr_label.setText("---")
+            self.hr_label.setStyleSheet("color: #808000;")
+            self.battery_label.setText("")
+            self.status_label.setText("Переподключение...")
+            self.status_label.setStyleSheet("color: #cc6600; font-size: 10px;")
             self.conn_btn.setText("Откл")
             self._set_style(False)
         else:
             self.hr_label.setText("---")
             self.hr_label.setStyleSheet("color: #808080;")
             self.unit_label.setText("")
+            self.battery_label.setText("")
             self.status_label.setText("Отключен")
             self.status_label.setStyleSheet("color: #808080; font-size: 10px;")
             self.conn_btn.setText("Подкл")
@@ -588,16 +725,20 @@ class DeviceDialog(QDialog):
         d = item.data(Qt.ItemDataRole.UserRole)
         dlg = AddSensorDialog(d, self)
         if dlg.exec() == QDialog.DialogCode.Accepted:
-            sid = max(sensors.keys(), default=-1) + 1
+            sid = next_sensor_id()
             sensors[sid] = {
                 "id": sid,
                 "name": dlg.result_name,
                 "address": d["address"],
                 "hr": 0,
+                "battery": None,
                 "connected": False,
-                "status": "disconnected"
+                "status": "disconnected",
+                "auto_reconnect": True,
+                "color": color_for_index(sid),
             }
-            run_ble(connect_ble(sid, d["address"], signals.hr_updated))
+            save_sensors_config()
+            run_ble(connect_ble(sid, d["address"], signals.hr_updated, signals.battery_updated, signals.sensor_disconnected))
             self.refresh_added()
 
     def rename_selected(self):
@@ -614,6 +755,7 @@ class DeviceDialog(QDialog):
             new_name = dlg.result_name
             sensors[sid]["name"] = new_name
             self.rename_txt_file(old_name, new_name)
+            save_sensors_config()
             signals.sensor_renamed.emit(sid, new_name)
             self.refresh_added()
 
@@ -633,8 +775,10 @@ class DeviceDialog(QDialog):
             return
         sid = item.data(Qt.ItemDataRole.UserRole)
         if sid in sensors:
+            sensors[sid]["auto_reconnect"] = False
             run_ble(disconnect_ble(sid))
             del sensors[sid]
+            save_sensors_config()
         self.refresh_added()
         signals.sensor_renamed.emit(-1, "")
 
@@ -644,6 +788,7 @@ class DeviceDialog(QDialog):
             label = f"{s['name']}  |  {s['address']}"
             item = QListWidgetItem(label)
             item.setData(Qt.ItemDataRole.UserRole, sid)
+            item.setForeground(QColor(s.get("color", "#000080")))
             self.added_list.addItem(item)
 
 class MonitorWindow(QWidget):
@@ -659,6 +804,7 @@ class MonitorWindow(QWidget):
         self.hr_labels = {}
         self.status_labels = {}
         self.name_labels = {}
+        self.battery_labels = {}
         self.cards = {}
 
         main_layout = QVBoxLayout(self)
@@ -696,6 +842,7 @@ class MonitorWindow(QWidget):
 
         signals.hr_updated.connect(self.on_hr_updated)
         signals.sensor_renamed.connect(self.on_sensor_renamed)
+        signals.battery_updated.connect(self.on_battery_updated)
 
         self.refresh_timer = QTimer()
         self.refresh_timer.timeout.connect(self.refresh_layout)
@@ -719,6 +866,12 @@ class MonitorWindow(QWidget):
                 if sid in self.status_labels:
                     self.status_labels[sid].setText("Подключен")
                     self.status_labels[sid].setStyleSheet("color: #00aa00; font-size: 10px; background: transparent;")
+            elif s.get("status") == "reconnecting":
+                self.hr_labels[sid].setText("---")
+                self.hr_labels[sid].setStyleSheet("color: #cc6600; font-size: 36px; font-weight: bold; background: transparent;")
+                if sid in self.status_labels:
+                    self.status_labels[sid].setText("Переподключение...")
+                    self.status_labels[sid].setStyleSheet("color: #cc6600; font-size: 9px; background: transparent;")
             else:
                 self.hr_labels[sid].setText("---")
                 self.hr_labels[sid].setStyleSheet("color: #003300; font-size: 36px; font-weight: bold; background: transparent;")
@@ -726,6 +879,10 @@ class MonitorWindow(QWidget):
                     self.status_labels[sid].setText("Отключен")
                     self.status_labels[sid].setStyleSheet("color: #003300; font-size: 10px; background: transparent;")
         self.update_header()
+
+    def on_battery_updated(self, sid, level):
+        if sid in self.battery_labels:
+            self.battery_labels[sid].setText(f"Заряд: {level}%")
 
     def on_sensor_renamed(self, sid, new_name):
         if sid in self.name_labels:
@@ -756,27 +913,29 @@ class MonitorWindow(QWidget):
             self.hr_labels.pop(sid, None)
             self.status_labels.pop(sid, None)
             self.name_labels.pop(sid, None)
+            self.battery_labels.pop(sid, None)
         for sid in current_ids - widget_ids:
             self.add_monitor_card(sid)
         self.update_header()
 
     def add_monitor_card(self, sid):
         s = sensors[sid]
+        color = s.get("color", "#00cc00")
         card = QWidget()
-        card.setStyleSheet("background: #000; border: 1px solid #003300; border-radius: 4px;")
+        card.setStyleSheet(f"background: #000; border: 1px solid {color}; border-radius: 4px;")
         card_layout = QHBoxLayout(card)
         card_layout.setContentsMargins(4, 4, 4, 4)
         card_layout.setSpacing(4)
 
         info = QWidget()
         info.setFixedWidth(90)
-        info.setStyleSheet("background: #050505; border-right: 1px solid #003300;")
+        info.setStyleSheet(f"background: #050505; border-right: 1px solid {color};")
         info_layout = QVBoxLayout(info)
         info_layout.setContentsMargins(4, 4, 4, 4)
         info_layout.setSpacing(2)
 
         name_lbl = QLabel(s["name"])
-        name_lbl.setStyleSheet("color: #00aa00; font-size: 10px; font-weight: bold; background: transparent;")
+        name_lbl.setStyleSheet(f"color: {color}; font-size: 10px; font-weight: bold; background: transparent;")
         name_lbl.setFont(QFont("Tahoma", 8, QFont.Weight.Bold))
         name_lbl.setWordWrap(True)
 
@@ -789,6 +948,12 @@ class MonitorWindow(QWidget):
         unit_lbl.setStyleSheet("color: #004400; font-size: 9px; background: transparent;")
         unit_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
 
+        battery_lbl = QLabel("")
+        battery_lbl.setStyleSheet("color: #666600; font-size: 9px; background: transparent;")
+        battery_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        if s.get("battery") is not None:
+            battery_lbl.setText(f"Заряд: {s['battery']}%")
+
         status_lbl = QLabel("Отключен")
         status_lbl.setStyleSheet("color: #003300; font-size: 9px; background: transparent;")
         status_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
@@ -796,6 +961,7 @@ class MonitorWindow(QWidget):
         info_layout.addWidget(name_lbl)
         info_layout.addWidget(hr_lbl)
         info_layout.addWidget(unit_lbl)
+        info_layout.addWidget(battery_lbl)
         info_layout.addWidget(status_lbl)
         info_layout.addStretch()
 
@@ -811,6 +977,40 @@ class MonitorWindow(QWidget):
         self.hr_labels[sid] = hr_lbl
         self.status_labels[sid] = status_lbl
         self.name_labels[sid] = name_lbl
+        self.battery_labels[sid] = battery_lbl
+
+class ToastNotification(QWidget):
+    def __init__(self, text, parent):
+        super().__init__(parent)
+        self.setStyleSheet("""
+            QWidget {
+                background: #fff4d0;
+                border: 2px solid #cc8800;
+            }
+            QLabel {
+                color: #663300;
+                font-size: 11px;
+                background: transparent;
+            }
+        """)
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(10, 6, 10, 6)
+        label = QLabel(text)
+        label.setWordWrap(True)
+        layout.addWidget(label)
+        self.adjustSize()
+        self.setFixedWidth(280)
+        self.adjustSize()
+
+    def show_at(self, x, y, duration_ms=5000):
+        self.move(x, y)
+        self.show()
+        self.raise_()
+        QTimer.singleShot(duration_ms, self.close_and_delete)
+
+    def close_and_delete(self):
+        self.close()
+        self.deleteLater()
 
 class MainWindow(QMainWindow):
     def __init__(self):
@@ -935,6 +1135,8 @@ class MainWindow(QMainWindow):
 
         signals.hr_updated.connect(self.on_hr_updated)
         signals.sensor_renamed.connect(self.on_sensor_renamed)
+        signals.sensor_disconnected.connect(self.on_sensor_disconnected)
+        self.active_toasts = []
 
         self.refresh_timer = QTimer()
         self.refresh_timer.timeout.connect(self.refresh_sensor_cards)
@@ -942,6 +1144,40 @@ class MainWindow(QMainWindow):
 
         self.log_timer = QTimer()
         self.log_timer.timeout.connect(self.do_log_tick)
+
+        self.no_sensor_timer = QTimer()
+        self.no_sensor_timer.setSingleShot(True)
+        self.no_sensor_timer.timeout.connect(self.on_no_sensor_timeout)
+
+        self.load_saved_sensors()
+
+    def on_sensor_disconnected(self, sid, name):
+        text = f"Связь потеряна с датчиком «{name}». Пытаюсь переподключиться..."
+        toast = ToastNotification(text, self)
+        self.active_toasts = [t for t in self.active_toasts if t.isVisible()]
+        y = 40 + sum(t.height() + 8 for t in self.active_toasts)
+        x = self.width() - toast.width() - 20
+        self.active_toasts.append(toast)
+        toast.show_at(x, y)
+
+    def load_saved_sensors(self):
+        saved = load_sensors_config()
+        for entry in saved:
+            sid = next_sensor_id()
+            sensors[sid] = {
+                "id": sid,
+                "name": entry.get("name", f"Датчик {sid}"),
+                "address": entry.get("address", ""),
+                "hr": 0,
+                "battery": None,
+                "connected": False,
+                "status": "disconnected",
+                "auto_reconnect": True,
+                "color": entry.get("color") or color_for_index(sid),
+            }
+        self.rebuild_sensor_grid()
+        for sid, s in sensors.items():
+            run_ble(connect_ble(sid, s["address"], signals.hr_updated, signals.battery_updated, signals.sensor_disconnected))
 
     def open_device_dialog(self):
         dlg = DeviceDialog(self)
@@ -971,8 +1207,10 @@ class MainWindow(QMainWindow):
 
     def remove_sensor(self, sid):
         if sid in sensors:
+            sensors[sid]["auto_reconnect"] = False
             run_ble(disconnect_ble(sid))
             del sensors[sid]
+            save_sensors_config()
         self.rebuild_sensor_grid()
 
     def refresh_sensor_cards(self):
@@ -1010,6 +1248,7 @@ class MainWindow(QMainWindow):
             self.log_status_lbl.setText("Запись остановлена")
             self.log_status_lbl.setStyleSheet("color: #808080;")
             self.log_timer.stop()
+            self.no_sensor_timer.stop()
 
     def set_interval(self, val):
         self.log_interval = val
@@ -1030,6 +1269,27 @@ class MainWindow(QMainWindow):
             self.log_data.pop(0)
         self.update_log_table()
         self.write_txt_files()
+
+        any_connected = any(sensors[i]["connected"] for i in ids)
+        if any_connected:
+            if self.no_sensor_timer.isActive():
+                self.no_sensor_timer.stop()
+            self.log_status_lbl.setText("Запись активна...")
+            self.log_status_lbl.setStyleSheet("color: #006400; font-weight: bold;")
+        else:
+            if not self.no_sensor_timer.isActive():
+                self.no_sensor_timer.start(30000)
+            self.log_status_lbl.setText("Нет подключённых датчиков — запись остановится через 30 сек...")
+            self.log_status_lbl.setStyleSheet("color: #cc6600; font-weight: bold;")
+
+    def on_no_sensor_timeout(self):
+        if not self.logging_active:
+            return
+        self.logging_active = False
+        self.log_btn.setText("Начать запись")
+        self.log_status_lbl.setText("Запись остановлена: нет подключённых датчиков")
+        self.log_status_lbl.setStyleSheet("color: #808080;")
+        self.log_timer.stop()
 
     def write_txt_files(self):
         folder = os.path.dirname(os.path.abspath(sys.argv[0]))
