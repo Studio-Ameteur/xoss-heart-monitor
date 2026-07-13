@@ -6,6 +6,7 @@ import csv
 import os
 import json
 import colorsys
+import traceback
 from datetime import datetime
 
 from PyQt6.QtWidgets import (
@@ -27,6 +28,43 @@ HEART_RATE_UUID = "00002a37-0000-1000-8000-00805f9b34fb"
 BATTERY_LEVEL_UUID = "00002a19-0000-1000-8000-00805f9b34fb"
 RECONNECT_DELAY_SEC = 5
 BATTERY_POLL_TICKS = 30
+
+def crash_log_path():
+    folder = os.path.dirname(os.path.abspath(sys.argv[0]))
+    return os.path.join(folder, "crash_log.txt")
+
+def log_crash(source, exc_type, exc_value, exc_tb):
+    try:
+        with open(crash_log_path(), "a", encoding="utf-8") as f:
+            f.write(f"\n=== {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} [{source}] ===\n")
+            f.write("".join(traceback.format_exception(exc_type, exc_value, exc_tb)))
+    except Exception:
+        pass
+
+def install_crash_logging():
+    def qt_excepthook(exc_type, exc_value, exc_tb):
+        log_crash("Qt main thread", exc_type, exc_value, exc_tb)
+        sys.__excepthook__(exc_type, exc_value, exc_tb)
+    sys.excepthook = qt_excepthook
+
+    def thread_excepthook(args):
+        log_crash(f"thread:{args.thread.name}", args.exc_type, args.exc_value, args.exc_traceback)
+    threading.excepthook = thread_excepthook
+
+    def asyncio_exception_handler(loop, context):
+        exc = context.get("exception")
+        if exc is not None:
+            log_crash("asyncio", type(exc), exc, exc.__traceback__)
+        else:
+            try:
+                with open(crash_log_path(), "a", encoding="utf-8") as f:
+                    f.write(f"\n=== {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} [asyncio] ===\n")
+                    f.write(str(context) + "\n")
+            except Exception:
+                pass
+    return asyncio_exception_handler
+
+asyncio_exception_handler = install_crash_logging()
 
 def resource_path(relative_path):
     if hasattr(sys, '_MEIPASS'):
@@ -163,12 +201,15 @@ def get_ble_loop():
     global ble_loop
     if ble_loop is None or not ble_loop.is_running():
         ble_loop = asyncio.new_event_loop()
+        ble_loop.set_exception_handler(asyncio_exception_handler)
         t = threading.Thread(target=ble_loop.run_forever, daemon=True)
         t.start()
     return ble_loop
 
 def run_ble(coro):
     return asyncio.run_coroutine_threadsafe(coro, get_ble_loop())
+
+ble_op_lock = asyncio.Lock()
 
 def parse_hr_measurement(data: bytes) -> int:
     """
@@ -235,7 +276,8 @@ async def connect_ble(sid, address, signal, battery_signal, disconnect_signal):
         signal.emit(sid, 0)
         try:
             client = BleakClient(address, timeout=10.0)
-            await client.connect()
+            async with ble_op_lock:
+                await client.connect()
             clients[sid] = client
             sensors[sid]["connected"] = True
             sensors[sid]["status"] = "connected"
@@ -264,7 +306,8 @@ async def connect_ble(sid, address, signal, battery_signal, disconnect_signal):
             except Exception:
                 pass
             try:
-                await client.disconnect()
+                async with ble_op_lock:
+                    await client.disconnect()
             except Exception:
                 pass
         except Exception:
@@ -311,7 +354,8 @@ async def disconnect_ble(sid):
         except Exception:
             pass
         try:
-            await client.disconnect()
+            async with ble_op_lock:
+                await client.disconnect()
         except Exception:
             pass
         if sid in clients:
