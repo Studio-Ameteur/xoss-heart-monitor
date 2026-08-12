@@ -223,7 +223,7 @@ def parse_hr_measurement(data: bytes) -> int:
     if not data or len(data) < 2:
         return 0
     flags = data[0]
-    hr_format_16bit = flags & 0x01  # bit 0: 0=uint8, 1=uint16
+    hr_format_16bit = flags & 0x01
     try:
         if hr_format_16bit:
             if len(data) < 3:
@@ -233,7 +233,7 @@ def parse_hr_measurement(data: bytes) -> int:
             hr = data[1]
     except Exception:
         return 0
-    # Sanity check: valid HR range 20-250 bpm
+    
     if hr < 20 or hr > 250:
         return 0
     return hr
@@ -715,7 +715,7 @@ class DeviceDialog(QDialog):
                 {"name": "XOSS Pro 3", "address": "AA:BB:CC:DD:EE:03", "rssi": -71},
             ])
 
-    # FIX: do_scan is now correctly indented as a method of DeviceDialog
+    
     async def do_scan(self):
         results = []
         try:
